@@ -1,0 +1,3 @@
+This program can be used to mirror parts of FTP servers to
+a local directory.  It has rudimentary support for not
+fetching old versions of programs.

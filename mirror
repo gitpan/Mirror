@@ -1,0 +1,528 @@
+#! /usr/bin/perl
+use LWP::Simple;
+use Getopt::Long;
+use File::Path;
+use File::Recurse;
+use Net::FTP;
+use Net::Domain qw(hostfqdn);
+use Net::Cmd;
+use POSIX;
+use GDBM_File;
+
+=head1 NAME
+
+mirror - Simple FTP mirror program
+
+=head1 SYNOPSIS
+
+  mirror [--from URL] [--to directory] [--skip regex] [--maxsize integer]
+	 [--norecurse] [--passive] [--verbose] [--deleteold]
+	 [--simulation] [--donttrymdtm] [--dashe]
+	 [--db filename]
+
+=head1 DESCRIPTION
+
+This program can be used to mirror parts of FTP servers to a local
+directory.  These are the meanings of the options:
+
+=over 4
+
+=item --from <URL>
+
+Where to mirror from.  This has to be an FTP url.  This can be a
+directory or an expression, where mirror allows simple globbing.
+Valid expressions are C<ftp://ftp.fu-berlin.de/pub/unix/mail>,
+C<ftp://ftp.fu-berlin.de/pub/gnu/g[cd][cb]>,
+C<ftp://ftp.fu-berlin.de/pub/gnu/g(cc|db)/>,
+C<ftp://ftp.fu-berlin.de/pub/gnu/g(cc|db)/g(cc|db)*.tar.gz>.
+
+=item --to <directory>
+
+Where to put the mirrored files.  If this does not start with a dot or a
+slash, it is assumed to be meant relative to the home of the user ftp.
+So maybe you could use C<pub/gnu> meaning C<~ftp/pub/gnu>.
+
+=item --skip <regex>
+
+Files matching this regular expression are not mirrored.
+
+=item --maxsize <integer>
+
+Files greater that this are not mirrored.
+
+=item --norecurse
+
+If you don't want mirror to descend all subdirectories, use this option.
+
+=item --passive
+
+Use passive FTP.
+
+=item --verbose
+
+Output tons of debug information.  Maybe this should be renamed to C<--debug>.
+
+=item --deleteold
+
+If you enable this option, mirror will try not to mirror old versions.
+Old versions that are replaced with newer version are also deleted.
+This applies only to the major version, several versions with the same
+major version can coexist.  Everything behind "pl", "b", "-beta", etc.
+is not part of the major version.  Please note that using this option is
+dangerous as it considers "gcc-2.7.1-2.7.2-diff.gz" as version "2.7.1"
+and will thus delete it if "gcc-2.7.2.tar.gz" is there.  So you might
+need an extra mirror to get the newest diffs, too.
+
+=item --simulation
+
+This option makes mirror run a simulation.  Everything will look like
+mirror actually mirrored something, but it will just write out what it
+would have mirrored, symlinked or deleted.
+
+=item --donttrymdtm
+
+MDTM is the FTP command to get the modificaton time of a file.  Mirror
+will normally try to use MDTM on all remote files to get the exact
+modification times.  Some old FTP servers do not support this option.
+Mirror will detect this and try to get the time from the directory
+listing.  But trying MDTM costs time, and you might want to tell mirror
+with this option that it should not even try to use MDTM.
+
+=item --dashe
+
+This experimental option could be used to get the exact time, too.  GNU
+ls has a "-le" option, which prints the date in the form "C<Sat Sep 21
+03:01:44  1996>" instead of "C<Sep 21 03:01>", so mirror can find out
+the seconds, too.  Unfortunately it is quite unlikely that someone with
+an FTP server that does not support MDTM uses a recent GNU ls on his FTP
+server, so this option is off by default.  Since parsing the normal "ls"
+output seems to work fine, I haven't really used this option.  Take
+care!
+
+=item --db
+
+Keep a database with the files that were already mirrored.  This is useful
+because mirror won't mirror things twice if they were already mirrored.
+So if the admin decides to delete a specific file, he can just delete it,
+and mirror won't mirror that file again.
+
+=back
+
+=head1 SEE ALSO
+
+L<lwp-mirror>, L<LWP>, L<lwp-request>, L<webmirror>
+
+=head1 COPYRIGHT
+
+mirror is Copyright (c) 1996 Felix von Leitner. All rights reserved.
+libwww-perl is Copyright (c) 1995, 1996 Gisle Aas. All rights reserved.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=head1 AUTHOR
+
+Felix von Leitner <leitner@math.fu-berlin.de>
+
+=cut
+
+%months=("Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4,
+         "May" => 5, "Jun" => 6, "Jul" => 7, "Aug" => 8,
+	 "Sep" => 9, "Oct" =>10 ,"Nov" =>11, "Dec" =>12);
+{ 
+  my $dummy;
+  ($dummy,$dummy,$dummy,$dummy,$thismon,$thisyear,$dummy,$dummy,$dummy) = localtime(time);
+  $thisyear+=1900;
+}
+$recurse=1;
+$maxsize=-1;
+&GetOptions(
+	"from=s" => \$from,
+	"to=s" => \$to,
+	"db=s" => \$db,
+	"skip=s" => \$skip,
+	"maxsize=i" => \$maxsize,
+	"passive!" => \$passive,
+	"verbose!" => \$verbose,
+	"simulation!" => \$simulation,
+	"donttrymdtm" => \$nomdtm,
+	"dashe!" => \$dashe,
+	"deleteold!" => \$deleteold,
+	"recurse!" => \$recurse);
+if ($#ARGV==1) {
+  $from = shift(@ARGV);
+  $to = shift(@ARGV);
+}
+if ($#ARGV==0) {
+  if (length($from)) {
+    $to = shift(@ARGV);
+  } else {
+    $from = shift(@ARGV);
+  }
+}
+if ($to =~ m/^[^.\/]/) {
+  ($name,$passwd,$uid,$gid,$quota,$comment,$gcos,$dir,$shell) = getpwnam("ftp");
+  $to = "$dir/$to";
+}
+if ($to eq "") { chomp($to = `pwd`); }
+if ($verbose) {
+  print "--from $from\n";
+  print "--to $to\n";
+  print "--skip $skip\n" if (length($skip));
+  if ($recurse) { print "--recurse\n"; } else { print "--norecurse\n"; }
+  if ($passive) { print "--passive\n"; } else { print "--nopassive\n"; }
+}
+if (defined $db) {
+  tie %history, GDBM_File, $db, &GDBM_WRCREAT, 0640;
+}
+if ($from =~ m,ftp://([^/]+)(/.*),) {
+  $path=$2; $host=$1;
+  ($name) = getpwuid($<);
+  $passwd="$name\@"; # . &hostfqdn();
+  print "GET $path from $host, log in as anonymous, password $passwd \n";
+
+  @listrequests = &generate("",$path);
+#  foreach $i (@listrequests) {
+#    print "$i\n";
+#  }
+  if ($ftp = Net::FTP->new($1,Passive => $passive)) {
+    print "connection established\n" if ($verbose);
+    if ($ftp->login("anonymous",$passwd)) {
+      print "login successful\n" if ($verbose);
+      while ($i = shift(@listrequests)) {
+	chomp($i); chomp($i);
+	if ($ftp->cwd($i)) {
+	  push @listrequests,"$i/.*";
+	  $prefix=$i if ($prefix eq "");
+	} else {
+ 	  my ($a,$b) = ($i =~ m,^([^*+]*)/([^/]*[\*].*),);
+#	  print "$i : $a : $b\n";
+	  if ($ftp->cwd($a)) {
+	    $prefix=$a if ($prefix eq "");
+	    { my $temp;
+	      if ($dashe) {
+		$temp=$ftp->dir("-e");
+	      } else {
+		$temp=undef;
+	      }
+	      if (not defined $temp or ($#{$temp}==-1) or (@{$temp}[0] =~ /illegal/)) {
+		$temp=$ftp->dir();
+		if (not defined $temp) {
+		  print "Could not list directory ",$a,"\n";
+		  next;
+		}
+	      }
+	      @listing=@{$temp};
+	    }
+	    foreach $j (@listing) {
+	      if (($tmp=&parse($j,$a)) != -1) {
+		my ($typ,$dir,$file,$size,$mdtm) = split(":",$tmp);
+		my ($c,$d)=($b =~ m,([^/]*)/(.*),);
+		if ($b =~ m,/,) {	# expecting directories
+#		  print "Expecting directories matching $b\n";
+		  if ($typ ne "-" and $file =~ m/^$c/) {
+#		    print "Adding: $a/$file/$d\n" if ($verbose);
+		    push @listrequests,"$a/$file/$d";
+		  } # sonst ist es eine Datei, oder matcht nicht
+		} else {		# expecting files
+#		  print "Expecting files matching $b\n";
+		  if ($typ eq "d") {
+		    print "$a $file $b\n";
+		    if ($recurse and not $file =~ /^\./) {
+		      push @listrequests,"$a/$file/$b\n";
+		    }
+		  } else {
+		    next if ($maxsize>0 and $size>=$maxsize);
+		    next unless ($typ ne "d" and $file =~ m/^$b$/);
+		    if ($file =~ /\d+([.-_]\d+)*/) {
+		      my ($name,$version);
+		      $version=$&;
+		      $name = $file; $name =~ s/$version.*//;
+		      if (defined $memory{$name}) {
+			if (&comp($memory{$name},$version)<0) {
+			  $memory{$name}="$version";
+			}
+		      } else {
+			$memory{$name}="$version";
+		      }
+		    }
+		    push @files,$tmp;
+		  }
+		}
+	      }
+	    }
+	  } else {
+	    print "Could not chdir to $a: ",$ftp->message(),"\n";
+	  }
+	}
+      }
+    } else {
+      print "Login failed: ",$ftp->message(),"\n";
+    }
+  } else {
+    print "Could not connect to $1\n"
+  }
+#  print "Files to get:\n\n";
+#  foreach $i (@files) {
+#    print "$i\n";
+#  }
+  foreach $i (@files) {
+    my ($typ,$dir,$file,$size,$mdtm) = split(':',$i);
+    if ($typ eq "l") {
+      $remotefile="$dir/$file"; 
+      $j=$remotefile; substr($j,0,length($prefix))=""; $j=~s,^/*,,; $localfile="$to/$j";
+      $files{$localfile}=1;
+      push @links,$i;
+    } elsif ($typ eq "-") {
+      if ($deleteold and $file =~ /\d+([.-_]\d+)*/) {
+	$version=$&;
+	$name = $file; $name =~ s/$version.*//;
+	$file =~ /\d+(?:[.-_]\d+)*([a-z.-_+\& ]*[0-9]+)*/; $minor=$1;
+	if (length($name) and defined $memory{$name}) {
+	  if (&comp($memory{$name},$version)>0) {
+	    print "$file is obsolete, not getting it.\n"; # if ($verbose);
+	    $file=undef;
+	    delete $files{$file};
+	    next;
+	  }
+	}
+      }
+      if ($dir ne $lastdir) {
+        if ($ftp->cwd($dir)) {
+	  $lastdir=$dir;
+	} else {
+	  print "Cannot chdir to: $dir\n";
+	  next;
+	}
+      }
+      if (length($skip) and "$dir/$file" =~ $skip) {
+        print "Skipping ftp://$host$dir/$file\n" if ($verbose);
+	undef $i;
+      } else {
+	$remotefile="$dir/$file"; 
+	$j=$remotefile; substr($j,0,length($prefix))=""; $j=~s,^/*,,; $localfile="$to/$j";
+	$files{$localfile}=1;
+	print "Remote file: $remotefile, local file: $localfile\n" if ($verbose);
+	if (($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+	     $atime,$mtime,$ctime,$blksize,$blocks) = stat($localfile)) {
+	  if ($mtime >= $mdtm) {
+	    print "File $localfile is up to date.\n" if ($verbose);
+	    next;
+	  }
+	}
+	my ($path,$rest) = ($localfile =~ m,(.*)/([^/]*),);
+	mkpath($path);
+	if (exists ($history{$localfile})) {
+	  print "File $localfile is in history\n" if ($verbose);
+	} else {
+	  print "Getting $remotefile as $localfile\n";
+	  next if ($simulation);
+	  $ftp->get($remotefile,"$path/.in.$rest");
+	  if (int($ftp->code/100)==2) {
+	    unlink($localfile);
+	    link("$path/.in.$rest",$localfile);
+	    unlink("$path/.in.$rest");
+	    utime $mdtm,$mdtm,$localfile;
+	    $history{$localfile}=1;
+	  } else {
+	    print "GET failed (code ",$ftp->code,": ",$ftp->message,"\n";
+	    unlink("$path/.in.$rest");
+	  }
+	}
+      }
+    } else {
+      print "Invalid type: $typ\n";
+    }
+  }
+  foreach $i (@links) {
+    my ($typ,$dir,$file,$size,$mdtm) = split(':',$i);
+    $remotefile="$dir/$file"; 
+    $j=$remotefile; substr($j,0,length($prefix))=""; $j=~s,^/*,,; $localfile="$to/$j";
+    my ($pfad,$datei) = ($localfile =~ m,(.*)/([^/]*)$,);
+    mkpath($pfad);
+    if (-l $localfile and $mdtm eq readlink($localfile)) {
+      print "Link $localfile -> $mdtm is already there.\n" if ($verbose);
+    } else {
+      print "Link: $localfile -> $mdtm\n";
+      next if ($simulation);
+      unlink($localfile);
+      symlink($mdtm,$localfile);
+    }
+  }
+#  chdir($to);
+  recurse {
+    unlink if (m,/\.in\.,);
+    if (-d) {
+      print "rmdir $_\n" if (rmdir);
+    } elsif (not defined $files{"$_"}) {
+      delete $history{$_};
+      print "rm $_\n";
+      unlink unless ($simulation);
+    }
+# push @localfiles,$_;
+  } "$to";
+
+  recurse { if (-d) { rmdir; } } "$to";
+  $ftp->quit;
+#  $ftp->login("anonymous","$name\@" . hostfdqn
+}
+untie %history if defined $db;
+exit 0;
+
+sub generate() {
+  my $prefix = shift;
+  my $pat = shift;
+  my $first,my $level=0,my $rest,my @alternatives,my @result;
+# Ich möchte folgende Ausdrücke zulassen:
+#    gcc*		- Simples Shell-like globbing
+#    gcc*/gcc*gz	- Simples Shell-like globbing
+#    gcc*/g(cc|db)*gz	- Nicht-so-simples globbing
+#  print "------------------------------------------------\n";
+#  print "Prefix: $prefix, Rest: $rest, Level $level, Alternative $alternative\n";
+  do {
+    $first=substr($pat,0,1);
+    substr($pat,0,1)="";
+    if ($first eq "\\") {	# escaped characters don't count
+      $first=substr($pat,0,1);
+      substr($pat,0,1)="";
+      if ($level==0 and $#alternatives<0) {
+        $prefix .= $first;
+      } else {
+        $rest .= "\\$first";
+      }
+    } elsif ($first eq "(") {	# alternatives
+      $rest .= $first if $level>0;
+      $level++;
+    } elsif ($first eq "|") {	# next alternative
+      if ($level==1) {
+	$alternative++;
+	push @alternatives,$rest;
+#	foreach $i (@alternatives) { print "1 $i\n"; }
+	$rest="";
+      } else {
+	$rest .= $first;
+      }
+    } elsif ($first eq ")") {	# end alternative
+      $level--;
+      if ($level==0) {
+#	foreach $i (@alternatives) { print "2 $i\n"; }
+	push @alternatives,$rest;
+	$rest="";
+      } else {
+	$rest .= $first if $level>0;
+      }
+    } else {
+      if ($level==0 and $#alternatives<0) {
+        $prefix .= $first;
+      } else {
+        $rest .= "$first";
+      }
+    }
+#    print "Prefix: $prefix, Rest: $rest, Level $level, Alternative $alternative\n";
+  } while (length($pat));
+  if ($#alternatives>=0) {
+    foreach $i (@alternatives) {
+      if ($i =~ m/\(/) {
+	@result = (@result, &generate($prefix,$i . $rest));
+      } else {
+	@result = (@result, "$prefix$i$rest");
+      }
+    }
+  } else {
+    @result = (@result, "$prefix");
+  }
+  return @result;
+}
+
+sub parse() {
+  my $j=shift;
+  my $dir=shift;
+
+  if ($j =~ m/^\+/) {		# EPLF
+    my $mdtm,my $size,my $file;
+    my $sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst;
+    ($mdtm) = ($j =~ m/[+,]m([0-9]+),/);
+    ($size) = ($j =~ m/[+,]s([0-9]+),/);
+    ($file) = ($j =~ m/\t(.*)/); chomp($file); chomp($file);
+#    ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($mdtm);
+#    $mdtm = sprintf("%04d%02d%02d%02d%02d%02d",$year+1900,$mon+1,$mday,$hour,$min,$sec);
+    if ($j =~ m/[+,]r,/) { $typ="-"; } else { $typ="d"; }
+    return -1 if ($file eq "." or $file eq "..");
+    return join(':', $typ,$dir,$file,$size,$mdtm);
+  } else {
+    next if ($j =~ m/^total / or $j =~ m/^[^dl-]/);
+    $typ=substr($j,0,1);
+    next if ($typ =~ m/[^-dl]/);	# nicht Datei, Link oder Verzeichnis
+    @temp=split("[ 	]+",$j);
+    if ($typ eq "l") {
+      print "Symlink: $j\n" if ($verbose);
+      if ($temp[$#temp-1] eq "->") {
+	return join(':', "l",$dir,$temp[$#temp-2],0,$temp[$#temp]);
+      } else {
+	print "invalid symlink: $j\n";
+	return -1;
+      }
+    } elsif ($typ eq "d") {
+      print "Directory: $j\n" if ($verbose);
+      $file = $temp[$#temp];
+      return -1 if ($file eq "." or $file eq "..");
+      return join(':', "d",$dir,$file,0,0);
+    } else {
+      print "File: $temp[$#temp], size ",$temp[$#temp-4],"\n" if ($verbose);
+      if ($temp[$#temp-1] =~ m/(19|20)[0-9]{2}/ and
+	  $temp[$#temp-2] =~ m/[0-9 ]{2}:[0-9 ]{2}:[0-9 ]{2}/) {	# long time
+	$year=$temp[$#temp-1];
+	$day=$temp[$#temp-3];
+	$mon=$months{$temp[$#temp-4]};
+	my @time=split(":",$temp[$#temp-2]);
+	$mdtm = POSIX::mktime($time[2], $time[1], $time[0], $day, $mon-1, $year - 1900,0,0,-1);
+	return join(':', "-",$dir,$temp[$#temp],$temp[$#temp-4],$mdtm);
+      } else {
+	if (!$nomdtm) {
+	  if ($ftp->quot("MDTM","$temp[$#temp]") == 2) {
+	    ($year,$mon,$day,$hour,$min,$sec)=($ftp->message() =~ m/(....)(..)(..)(..)(..)(..)/);
+	    $mdtm = POSIX::mktime($sec, $min, $hour, $day, $mon-1, $year - 1900,0,0,-1);
+	    return join(':', "-",$dir,$temp[$#temp],$temp[$#temp-4],$mdtm);
+	  } else {
+	    if ($ftp->code == 500) {
+	      print "Remote site does not understand MDTM.\n";
+	      $nomdtm=1;
+	    } else {
+	      print "MDTM error (code ",$ftp->code,"): ",$ftp->message,".\n";
+	      return -1;
+	    }
+	  }
+	}
+	if ($nomdtm) {
+	  $day=$temp[$#temp-2];
+	  $mon=$months{$temp[$#temp-3]};
+	  if ($temp[$#temp-1] =~ m/:/) {
+	    my @time=split(":",$temp[$#temp-1]);
+	    $hour=$time[0];
+	    $min=$time[1];
+	    $year=$thisyear;
+	    $year-- if ($mon>$thismon);
+	  } else {
+	    $hour=0; $min=0;
+	    $year=$temp[$#temp-1];
+	  }
+	  $mdtm = POSIX::mktime(0, $min, $hour, $day, $mon-1, $year - 1900,0,0,-1);
+	  return join(':', "-",$dir,$temp[$#temp],$temp[$#temp-4],$mdtm);
+	}
+      }
+    }
+  }
+}
+
+sub comp() {
+  my ($x,$y,@c,@d,$t)=@_;
+  @c=$x =~ /\d+/g; @d=$y =~ /\d+/g;
+  for (;;) {
+    $x=shift @c; $y=shift @d;
+    return 1 if defined $x and not defined $y;	# 1.0.1 <=> 1.0
+    return -1 if not defined $x and defined $y;	# 1.0 <=> 1.0.1
+    return 0 unless defined $x and defined $y;	# 1.0 <=> 1.0
+    $t=$x<=>$y;
+    return $t if $t;
+  }
+}
